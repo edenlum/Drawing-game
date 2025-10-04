@@ -2,6 +2,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 import uuid
 from datetime import datetime, timedelta
+import json
+import os
+import time
 
 # Page configuration
 st.set_page_config(
@@ -50,10 +53,45 @@ if 'player_name' not in st.session_state:
     st.session_state.player_name = ""
 if 'is_host' not in st.session_state:
     st.session_state.is_host = False
-if 'games' not in st.session_state:
-    st.session_state.games = {}
 if 'current_game' not in st.session_state:
     st.session_state.current_game = None
+
+# Initialize persistent storage
+@st.cache_data(ttl=60)  # Cache for 1 minute
+def load_games():
+    """Load games from persistent storage"""
+    try:
+        if os.path.exists('games.json'):
+            with open('games.json', 'r') as f:
+                return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, Exception):
+        pass
+    return {}
+
+def save_games(games_data):
+    """Save games to persistent storage"""
+    try:
+        with open('games.json', 'w') as f:
+            json.dump(games_data, f, default=str)
+    except Exception as e:
+        st.error(f"Error saving games: {e}")
+
+def get_games():
+    """Get current games from storage"""
+    return load_games()
+
+def update_game(game_id, game_data):
+    """Update a specific game in storage"""
+    games = load_games()
+    games[game_id] = game_data
+    save_games(games)
+
+def delete_game(game_id):
+    """Delete a game from storage"""
+    games = load_games()
+    if game_id in games:
+        del games[game_id]
+        save_games(games)
 
 def generate_game_id():
     """Generate a unique 6-character game ID"""
@@ -66,38 +104,48 @@ def create_game(player_name):
         'id': game_id,
         'host': player_name,
         'players': [player_name],
-        'created_at': datetime.now(),
+        'created_at': datetime.now().isoformat(),
         'status': 'waiting',  # waiting, playing, finished
         'canvas_data': None,
         'current_drawer': None,
         'round': 1,
         'max_rounds': 3
     }
-    st.session_state.games[game_id] = game_data
+    update_game(game_id, game_data)
     return game_id
 
 def join_game(game_id, player_name):
     """Join an existing game"""
-    if game_id in st.session_state.games:
-        if player_name not in st.session_state.games[game_id]['players']:
-            st.session_state.games[game_id]['players'].append(player_name)
+    games = get_games()
+    if game_id in games:
+        if player_name not in games[game_id]['players']:
+            games[game_id]['players'].append(player_name)
+            update_game(game_id, games[game_id])
         return True
     return False
 
 def get_game_info(game_id):
     """Get information about a specific game"""
-    return st.session_state.games.get(game_id, None)
+    games = get_games()
+    return games.get(game_id, None)
 
 def cleanup_old_games():
     """Remove games older than 1 hour"""
     current_time = datetime.now()
+    games = get_games()
     games_to_remove = []
-    for game_id, game_data in st.session_state.games.items():
-        if current_time - game_data['created_at'] > timedelta(hours=1):
+    
+    for game_id, game_data in games.items():
+        try:
+            created_at = datetime.fromisoformat(game_data['created_at'])
+            if current_time - created_at > timedelta(hours=1):
+                games_to_remove.append(game_id)
+        except (ValueError, KeyError, TypeError):
+            # If we can't parse the date, remove the game
             games_to_remove.append(game_id)
     
     for game_id in games_to_remove:
-        del st.session_state.games[game_id]
+        delete_game(game_id)
 
 def lobby_page():
     """Display the lobby page for creating and joining games"""
@@ -147,13 +195,20 @@ def lobby_page():
     
     # Display active games
     st.subheader("🏠 Active Games")
-    if st.session_state.games:
-        for game_id, game_data in st.session_state.games.items():
+    games = get_games()
+    if games:
+        for game_id, game_data in games.items():
+            try:
+                created_at = datetime.fromisoformat(game_data['created_at'])
+                created_time = created_at.strftime('%H:%M:%S')
+            except (ValueError, KeyError, TypeError):
+                created_time = "Unknown"
+                
             with st.expander(f"Game {game_id} - {len(game_data['players'])} players"):
                 st.write(f"**Host:** {game_data['host']}")
                 st.write(f"**Players:** {', '.join(game_data['players'])}")
                 st.write(f"**Status:** {game_data['status'].title()}")
-                st.write(f"**Created:** {game_data['created_at'].strftime('%H:%M:%S')}")
+                st.write(f"**Created:** {created_time}")
                 
                 if st.button(f"Join Game {game_id}", key=f"join_{game_id}"):
                     if st.session_state.player_name:
@@ -187,13 +242,18 @@ def lobby_page():
 
 def game_page():
     """Display the main game page"""
-    if not st.session_state.game_id or st.session_state.game_id not in st.session_state.games:
-        st.error("Game not found! Returning to lobby.")
+    if not st.session_state.game_id:
+        st.error("No game selected! Returning to lobby.")
         st.session_state.current_page = "lobby"
         st.rerun()
         return
     
-    game_data = st.session_state.games[st.session_state.game_id]
+    game_data = get_game_info(st.session_state.game_id)
+    if not game_data:
+        st.error("Game not found! Returning to lobby.")
+        st.session_state.current_page = "lobby"
+        st.rerun()
+        return
     
     # Game header
     col1, col2, col3 = st.columns([2, 1, 1])
@@ -208,6 +268,8 @@ def game_page():
     
     with col3:
         if st.button("🔄 Refresh"):
+            # Clear cache to get fresh data
+            load_games.clear()
             st.rerun()
     
     # Game info
@@ -220,17 +282,20 @@ def game_page():
         
         with col1:
             if st.button("▶️ Start Game", type="primary"):
-                st.session_state.games[st.session_state.game_id]['status'] = 'playing'
+                game_data['status'] = 'playing'
+                update_game(st.session_state.game_id, game_data)
                 st.rerun()
         
         with col2:
             if st.button("⏸️ Pause Game"):
-                st.session_state.games[st.session_state.game_id]['status'] = 'waiting'
+                game_data['status'] = 'waiting'
+                update_game(st.session_state.game_id, game_data)
                 st.rerun()
         
         with col3:
             if st.button("🛑 End Game"):
-                st.session_state.games[st.session_state.game_id]['status'] = 'finished'
+                game_data['status'] = 'finished'
+                update_game(st.session_state.game_id, game_data)
                 st.rerun()
     
     # Drawing area
@@ -465,6 +530,16 @@ def create_drawing_canvas(width, height, brush_size, color, tool):
 
 def main():
     """Main application function with page routing"""
+    # Auto-refresh for game pages to keep data synchronized
+    if st.session_state.current_page == "game" and st.session_state.game_id:
+        # Auto-refresh every 5 seconds when in a game
+        if 'last_refresh' not in st.session_state:
+            st.session_state.last_refresh = time.time()
+        
+        if time.time() - st.session_state.last_refresh > 5:
+            st.session_state.last_refresh = time.time()
+            load_games.clear()  # Clear cache to get fresh data
+    
     # Page routing
     if st.session_state.current_page == "lobby":
         lobby_page()
